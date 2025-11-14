@@ -7,6 +7,8 @@ from collections import defaultdict
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlparse
 from dataclasses import asdict
+from ftplib import FTP
+from io import BytesIO
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -54,9 +56,28 @@ def sanitize_for_storage_path(name: str) -> str:
     return name
 
 
+def get_bunnycdn_public_url(storage_path: str) -> str:
+    """
+    Construct public URL for BunnyCDN storage object.
+    
+    Args:
+        storage_path: Path to the object in storage (e.g., "scraped_product_images/client/article/references/image.jpg")
+        
+    Returns:
+        Public URL to access the stored object on BunnyCDN
+    """
+    # BunnyCDN public URL format: https://storage.bunnycdn.com/{storage_path}
+    # Note: Replace with your BunnyCDN pull zone URL if you have a custom domain
+    base_url = "https://storage.bunnycdn.com"
+    # Ensure storage_path doesn't have leading slash
+    storage_path = storage_path.lstrip('/')
+    return f"{base_url}/{storage_path}"
+
+
 def get_supabase_public_url(storage_path: str, supabase_url: str = None) -> str:
     """
     Construct public URL for Supabase Storage object.
+    DEPRECATED: Use get_bunnycdn_public_url instead.
     
     Args:
         storage_path: Path to the object in storage (e.g., "scraped_product_images/client/article/references/image.jpg")
@@ -314,15 +335,22 @@ async def update_single_item(
             logging.error(f"Full traceback: {traceback.format_exc()}")
 
 
-async def upload_images_to_storage_direct(
+async def upload_images_to_bunnycdn_ftp(
     image_urls: List[str], 
     client_name: str, 
-    article_id: str, 
-    supabase: Client
+    article_id: str
 ) -> List[str]:
     """
-    Upload images directly from URLs to Supabase Storage without local disk storage.
+    Upload images directly from URLs to BunnyCDN via FTP without local disk storage.
     Returns list of public URLs for uploaded images.
+    
+    Args:
+        image_urls: List of image URLs to download and upload
+        client_name: Client name for organizing files
+        article_id: Article ID for organizing files
+        
+    Returns:
+        List of public URLs for successfully uploaded images
     """
     uploaded_urls = []
     
@@ -330,43 +358,30 @@ async def upload_images_to_storage_direct(
         logging.warning("No image URLs provided for upload")
         return uploaded_urls
     
-    logging.info(f"Starting direct upload of {len(image_urls)} images for client: {client_name}, article: {article_id}")
+    # BunnyCDN FTP credentials (from environment variables)
+    ftp_host = os.getenv("BUNNYCDN_FTP_HOST", "storage.bunnycdn.com")
+    ftp_port = int(os.getenv("BUNNYCDN_FTP_PORT", "21"))
+    ftp_username = os.getenv("BUNNYCDN_FTP_USERNAME")
+    ftp_password = os.getenv("BUNNYCDN_FTP_PASSWORD")
     
-    for i, image_url in enumerate(image_urls, 1):
-        try:
-            # Detect file extension and content type from URL
-            file_extension = os.path.splitext(urlparse(image_url).path)[1].lower()
-            if not file_extension:
-                file_extension = '.jpg'  # Default fallback
-            
-            # Map extensions to content types
-            content_type_map = {
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg', 
-                '.png': 'image/png',
-                '.gif': 'image/gif',
-                '.webp': 'image/webp',
-                '.bmp': 'image/bmp',
-                '.tiff': 'image/tiff',
-                '.svg': 'image/svg+xml'
-            }
-            content_type = content_type_map.get(file_extension, 'image/jpeg')
-            
-            # Create storage path with correct extension
-            # Path is relative to bucket root (bucket name is already specified in .from_("assets"))
-            filename = f"image_{i}{file_extension}"
-            # Sanitize client_name and article_id for storage paths (remove special characters)
-            sanitized_client = sanitize_for_storage_path(client_name)
-            sanitized_article_id = sanitize_for_storage_path(article_id)
-            # Normalize path: remove any leading/trailing slashes, ensure proper format
-            # Store images in scraped_product_images folder within assets bucket
-            storage_path = f"scraped_product_images/{sanitized_client}/{sanitized_article_id}/references/{filename}".strip('/')
-            
-            logging.info(f"Downloading and uploading {filename} from: {image_url}")
-            logging.debug(f"Storage path: {storage_path}")
-            
-            # Download image data directly from URL
-            async with aiohttp.ClientSession() as session:
+    if not ftp_username or not ftp_password:
+        raise ValueError("BUNNYCDN_FTP_USERNAME and BUNNYCDN_FTP_PASSWORD must be set in environment variables")
+    
+    logging.info(f"Starting FTP upload of {len(image_urls)} images to BunnyCDN for client: {client_name}, article: {article_id}")
+    
+    # Download all images first
+    downloaded_images = []
+    async with aiohttp.ClientSession() as session:
+        for i, image_url in enumerate(image_urls, 1):
+            try:
+                # Detect file extension and content type from URL
+                file_extension = os.path.splitext(urlparse(image_url).path)[1].lower()
+                if not file_extension:
+                    file_extension = '.jpg'  # Default fallback
+                
+                filename = f"image_{i}{file_extension}"
+                logging.info(f"Downloading {filename} from: {image_url}")
+                
                 async with session.get(image_url, timeout=30) as response:
                     if response.status == 200:
                         image_data = await response.read()
@@ -380,69 +395,150 @@ async def upload_images_to_storage_direct(
                             logging.warning(f"Image data too small ({len(image_data)} bytes) for {image_url}, skipping")
                             continue
                         
-                        # Upload directly to Supabase Storage
-                        try:
-                            
-                            upload_response = supabase.storage.from_("assets").upload(
-                                path=storage_path,
-                                file=image_data,
-                                file_options={"content-type": content_type, "upsert": "true"}
-                            )
-                            
-                            # Check if upload was successful
-                            if upload_response:
-                                # Verify the response structure
-                                if isinstance(upload_response, dict):
-                                    # Some Supabase clients return dict with 'path' key
-                                    if 'path' in upload_response or 'id' in upload_response:
-                                        public_url = get_supabase_public_url(storage_path)
-                                        uploaded_urls.append(public_url)
-                                        logging.info(f"✓ Uploaded {filename} to storage: {public_url}")
-                                    else:
-                                        logging.warning(f"✗ Unexpected upload response format: {upload_response}")
-                                else:
-                                    # Assume success if response is truthy
-                                    public_url = get_supabase_public_url(storage_path)
-                                    uploaded_urls.append(public_url)
-                                    logging.info(f"✓ Uploaded {filename} to storage: {public_url}")
-                            else:
-                                logging.warning(f"✗ Failed to upload {filename} - no response from Supabase")
-                                
-                        except Exception as upload_error:
-                            if "409" in str(upload_error) or "Duplicate" in str(upload_error):
-                                # File exists, try to update it instead
-                                logging.info(f"File {filename} already exists, updating instead...")
-                                try:
-                                    update_response = supabase.storage.from_("assets").update(
-                                        path=storage_path,
-                                        file=image_data,
-                                        file_options={"content-type": content_type}
-                                    )
-                                    if update_response:
-                                        # Construct the public URL using storage_path for consistency
-                                        public_url = get_supabase_public_url(storage_path)
-                                        uploaded_urls.append(public_url)
-                                        logging.info(f"✓ Updated {filename} in storage: {public_url}")
-                                    else:
-                                        logging.warning(f"✗ Failed to update {filename} - no response from Supabase")
-                                except Exception as update_error:
-                                    logging.error(f"Failed to update existing file {filename}: {update_error}")
-                                    import traceback
-                                    logging.error(f"Update error traceback: {traceback.format_exc()}")
-                            else:
-                                logging.error(f"Upload error for {filename}: {upload_error}")
-                                import traceback
-                                logging.error(f"Upload error traceback: {traceback.format_exc()}")
-                    else:
-                        logging.error(f"Failed to download image from {image_url}: HTTP {response.status}")
+                        # Sanitize client_name and article_id for storage paths
+                        sanitized_client = sanitize_for_storage_path(client_name)
+                        sanitized_article_id = sanitize_for_storage_path(article_id)
+                        # Create storage path
+                        storage_path = f"scraped_product_images/{sanitized_client}/{sanitized_article_id}/references/{filename}"
                         
-        except Exception as e:
-            logging.error(f"Error processing {image_url}: {e}")
-            import traceback
-            logging.error(f"Full traceback: {traceback.format_exc()}")
+                        downloaded_images.append({
+                            'filename': filename,
+                            'data': image_data,
+                            'storage_path': storage_path
+                        })
+                    else:
+                        logging.warning(f"Failed to download image {image_url}: HTTP {response.status}")
+            except Exception as e:
+                logging.error(f"Error downloading image {image_url}: {e}")
+                import traceback
+                logging.error(f"Download error traceback: {traceback.format_exc()}")
     
-    logging.info(f"Direct upload complete. {len(uploaded_urls)}/{len(image_urls)} images uploaded successfully")
+    # Upload all downloaded images via FTP
+    if downloaded_images:
+        # Run FTP operations in executor since ftplib is synchronous
+        loop = asyncio.get_event_loop()
+        uploaded_urls = await loop.run_in_executor(
+            None,
+            _upload_to_bunnycdn_ftp_sync,
+            downloaded_images,
+            ftp_host,
+            ftp_port,
+            ftp_username,
+            ftp_password
+        )
+    
+    logging.info(f"Successfully uploaded {len(uploaded_urls)}/{len(image_urls)} images to BunnyCDN")
     return uploaded_urls
+
+
+def _upload_to_bunnycdn_ftp_sync(
+    downloaded_images: List[Dict[str, Any]],
+    ftp_host: str,
+    ftp_port: int,
+    ftp_username: str,
+    ftp_password: str
+) -> List[str]:
+    """
+    Synchronous FTP upload function (runs in executor).
+    
+    Args:
+        downloaded_images: List of dicts with 'filename', 'data', and 'storage_path'
+        ftp_host: FTP hostname
+        ftp_port: FTP port
+        ftp_username: FTP username
+        ftp_password: FTP password
+        
+    Returns:
+        List of public URLs for successfully uploaded images
+    """
+    uploaded_urls = []
+    ftp = None
+    
+    try:
+        # Connect to BunnyCDN FTP
+        logging.info(f"Connecting to BunnyCDN FTP: {ftp_host}:{ftp_port}")
+        ftp = FTP()
+        ftp.connect(ftp_host, ftp_port)
+        ftp.login(ftp_username, ftp_password)
+        logging.info("✓ Connected to BunnyCDN FTP")
+        
+        # Upload each image
+        for img_info in downloaded_images:
+            filename = img_info['filename']
+            image_data = img_info['data']
+            storage_path = img_info['storage_path']
+            
+            try:
+                # Create directory structure if needed
+                path_parts = storage_path.split('/')
+                directory_parts = path_parts[:-1]  # All parts except filename
+                
+                # Navigate/create directory structure
+                ftp.cwd('/')  # Start from root
+                for part in directory_parts:
+                    if part:  # Skip empty parts
+                        try:
+                            # Try to change to directory
+                            ftp.cwd(part)
+                        except Exception:
+                            # Directory doesn't exist, create it
+                            try:
+                                ftp.mkd(part)
+                                ftp.cwd(part)
+                                logging.debug(f"Created directory: {part}")
+                            except Exception as mkd_error:
+                                # Directory might have been created by another process
+                                # Try to change to it again
+                                try:
+                                    ftp.cwd(part)
+                                except Exception:
+                                    logging.warning(f"Could not create/access directory {part}: {mkd_error}")
+                                    raise
+                
+                # Upload file data
+                image_file = BytesIO(image_data)
+                ftp.storbinary(f'STOR {path_parts[-1]}', image_file)
+                
+                # Construct public URL
+                public_url = get_bunnycdn_public_url(storage_path)
+                uploaded_urls.append(public_url)
+                logging.info(f"✓ Uploaded {filename} to BunnyCDN: {public_url}")
+                
+            except Exception as upload_error:
+                logging.error(f"Failed to upload {filename}: {upload_error}")
+                import traceback
+                logging.error(f"Upload error traceback: {traceback.format_exc()}")
+        
+    except Exception as e:
+        logging.error(f"FTP connection/upload error: {e}")
+        import traceback
+        logging.error(f"FTP error traceback: {traceback.format_exc()}")
+    finally:
+        if ftp:
+            try:
+                ftp.quit()
+            except Exception:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+    
+    return uploaded_urls
+
+
+async def upload_images_to_storage_direct(
+    image_urls: List[str], 
+    client_name: str, 
+    article_id: str, 
+    supabase: Client = None
+) -> List[str]:
+    """
+    Upload images directly from URLs to BunnyCDN via FTP.
+    DEPRECATED: Supabase Storage upload replaced with BunnyCDN FTP.
+    Returns list of public URLs for uploaded images.
+    """
+    # Use BunnyCDN FTP instead of Supabase Storage
+    return await upload_images_to_bunnycdn_ftp(image_urls, client_name, article_id)
 
 
 # --- End Database Interaction ---
@@ -852,13 +948,12 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
                 # Clear kept_links to prevent any image processing
                 result.kept_links = []
             elif result.kept_links:
-                logging.info(f"Page is active (likely_null=False), uploading {len(result.kept_links)} images to Supabase Storage")
+                logging.info(f"Page is active (likely_null=False), uploading {len(result.kept_links)} images to BunnyCDN")
                 
-                storage_urls = await upload_images_to_storage_direct(
+                storage_urls = await upload_images_to_bunnycdn_ftp(
                     result.kept_links, 
                     client_name, 
-                    sku or f'product_{i}',  # sku is the article_id
-                    supabase
+                    sku or f'product_{i}'  # sku is the article_id
                 )
                 
                 # Update result with storage URLs
@@ -998,7 +1093,7 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
             if result.saved_count > 0:
                 logging.info(f"✓ Successfully extracted {result.saved_count} images for {name or 'Unknown Product'}")
                 if storage_urls:
-                    logging.info(f"✓ Uploaded {len(storage_urls)} images to Supabase Storage")
+                    logging.info(f"✓ Uploaded {len(storage_urls)} images to BunnyCDN")
                 if tag_result and not tag_result.error_message:
                     logging.info(f"✓ Generated {len(tag_result.generated_tags)} AI tags")
             else:
