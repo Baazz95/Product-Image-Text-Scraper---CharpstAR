@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  image-scraper:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-models/gemini-2.5-pro}
+    volumes:
+      - ./output:/app/output
+      - ./domain_profiles.json:/app/domain_profiles.json
+      - ./results.jsonl:/app/results.jsonl
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
