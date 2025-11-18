@@ -235,7 +235,7 @@ def _looks_like_404(html: str) -> bool:
         
         # Combine all text for checking
         head = ' '.join([title, h1, h2] + error_texts)
-        combined_text = f"{head} {body_text[:500]}"  # Check first 500 chars of body
+        combined_text = f"{head} {body_text[:1500]}"  # Check first 1500 chars of body
         
         # Check for 404 in text
         if ' 404' in f" {combined_text}" or '404 ' in f"{combined_text} ":
@@ -265,6 +265,7 @@ def _looks_like_404(html: str) -> bool:
             'hittades tyvärr inte',
             'sidan hittades inte',
             'hoppsan',
+            'sidan är försvunnen',  # "the page is gone"
             'åh nej, den här sidan verkar inte finnas',  # User's specific example
             'den här sidan verkar inte finnas',
             'produkten hittades inte',
@@ -1473,16 +1474,16 @@ async def learn_domain_selector(url: str, product_name: str, output_dir: str, ap
     if not html:
         # Check if it's a 404/error (empty HTML could mean HTTP error was detected)
         profile.notes = "Failed to load page (possibly 404 or HTTP error)"
-        return DownloadResult(status='NOT_FOUND', ai_used=True, profile=profile, html=None)
+        return DownloadResult(status='NOT_FOUND', ai_used=True, profile=profile, html=None, final_url=final_url)
     
     if not candidates:
         profile.notes = "Failed to find any image candidates."
-        return DownloadResult(status='FETCH_FAILED', ai_used=True, profile=profile, html=html)
+        return DownloadResult(status='FETCH_FAILED', ai_used=True, profile=profile, html=html, final_url=final_url)
 
     soup = BeautifulSoup(html, 'lxml')
     if _looks_like_404(html):
         profile.notes = 'Page appears to be 404/Not Found (detected via content analysis)'
-        return DownloadResult(status='NOT_FOUND', ai_used=False, profile=profile, html=html)
+        return DownloadResult(status='NOT_FOUND', ai_used=False, profile=profile, html=html, final_url=final_url)
     
     page_title = (soup.title.string if soup.title else '') or ''
     h1 = (soup.find('h1').get_text(strip=True) if soup.find('h1') else '')
@@ -1615,7 +1616,8 @@ async def learn_domain_selector(url: str, product_name: str, output_dir: str, ap
                 saved_count=saved_count,
                 kept_links=kept_links,
                 profile=profile,
-                html=html
+                html=html,
+                final_url=final_url
             )
 
     # If exactly one plausible candidate, bypass AI and keep it
@@ -1636,7 +1638,8 @@ async def learn_domain_selector(url: str, product_name: str, output_dir: str, ap
             saved_count=saved_count,
             kept_links=kept_links,
             profile=profile,
-            html=html
+            html=html,
+            final_url=final_url
         )
     
     
@@ -1652,7 +1655,7 @@ async def learn_domain_selector(url: str, product_name: str, output_dir: str, ap
     
     if not size_filtered:
         profile.notes = "No candidates passed size filtering"
-        return DownloadResult(status='NO_CANDIDATES', ai_used=True, profile=profile, html=html)
+        return DownloadResult(status='NO_CANDIDATES', ai_used=True, profile=profile, html=html, final_url=final_url)
 
     # Limit to top candidates for AI processing (increased to capture more product views)
     TOP_N = 25
@@ -1663,7 +1666,7 @@ async def learn_domain_selector(url: str, product_name: str, output_dir: str, ap
     api_key = api_key or os.getenv('GEMINI_API_KEY')
     if not api_key:
         profile.notes = "GEMINI_API_KEY missing"
-        return DownloadResult(status='ERROR', ai_used=True, profile=profile)
+        return DownloadResult(status='ERROR', ai_used=True, profile=profile, final_url=final_url)
 
     # Download and prepare images for Vision API
     async def download_image_for_analysis(image_url: str) -> Optional[bytes]:
@@ -1939,12 +1942,27 @@ async def learn_domain_selector(url: str, product_name: str, output_dir: str, ap
             pass
 
         # Normalize mapping: compare by normalized URL and by canonical basename
-        norm_kept_set = { _normalize_for_match(u) for u in kept_urls if isinstance(u, str) }
-        base_kept_set = { _canonical_basename(u) for u in kept_urls if isinstance(u, str) }
+        # Create mapping from normalized form to original URL from kept_urls
+        norm_to_original = { _normalize_for_match(u): u for u in kept_urls if isinstance(u, str) }
+        base_to_original = { _canonical_basename(u): u for u in kept_urls if isinstance(u, str) }
+        norm_kept_set = set(norm_to_original.keys())
+        base_kept_set = set(base_to_original.keys())
+        
         for cand in ai_candidates:
             try:
-                if _normalize_for_match(cand) in norm_kept_set or _canonical_basename(cand) in base_kept_set:
-                    kept_links.append(cand)
+                cand_norm = _normalize_for_match(cand)
+                cand_base = _canonical_basename(cand)
+                
+                # Find matching original URL from kept_urls
+                original_url = None
+                if cand_norm in norm_kept_set:
+                    original_url = norm_to_original[cand_norm]
+                elif cand_base in base_kept_set:
+                    original_url = base_to_original[cand_base]
+                
+                if original_url:
+                    # Use the ORIGINAL URL from kept_urls, not the candidate (which might be corrupted)
+                    kept_links.append(original_url)
             except Exception:
                 # Fall back to strict membership if normalization fails
                 if cand in kept_urls:

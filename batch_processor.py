@@ -20,6 +20,9 @@ from category_mapper import map_product_type_to_category, validate_category, val
 import aiohttp
 import base64
 
+# Load environment variables at module level
+load_dotenv()
+
 # --- Helper Functions ---
 
 def sanitize_for_storage_path(name: str) -> str:
@@ -56,22 +59,67 @@ def sanitize_for_storage_path(name: str) -> str:
     return name
 
 
-def get_bunnycdn_public_url(storage_path: str) -> str:
+def is_product_id_preserved_in_redirect(original_url: str, final_url: str, product_id: str = None) -> bool:
     """
-    Construct public URL for BunnyCDN storage object.
+    Check if the product ID from the original URL appears in the redirected URL.
+    
+    This allows redirects where the product ID is preserved (e.g., short URL → full product page)
+    while still catching redirects to completely different products.
+    
+    Works purely from URLs - extracts product ID from original URL and checks if it's in final URL.
+    The product_id parameter is optional and used as a fallback if extraction fails.
     
     Args:
-        storage_path: Path to the object in storage (e.g., "scraped_product_images/client/article/references/image.jpg")
+        original_url: The original product URL
+        final_url: The URL after redirect
+        product_id: Optional product ID (article_id/sku) - used as fallback if extraction fails
         
     Returns:
-        Public URL to access the stored object on BunnyCDN
+        True if product ID from original URL is found in final_url, False otherwise
     """
-    # BunnyCDN public URL format: https://storage.bunnycdn.com/{storage_path}
-    # Note: Replace with your BunnyCDN pull zone URL if you have a custom domain
-    base_url = "https://storage.bunnycdn.com"
+    if not final_url or not original_url:
+        return False
+    
+    import re
+    
+    # Extract numeric product ID from original URL (common patterns: /p/123456, /product/123456, etc.)
+    # Try multiple patterns to catch different URL structures
+    numeric_id_match = re.search(r'/(?:p|product|produkt|artikel|item)/?(\d+)', original_url, re.IGNORECASE)
+    
+    if numeric_id_match:
+        numeric_id = numeric_id_match.group(1)
+        # Check if this numeric ID appears anywhere in the final URL
+        if numeric_id in final_url:
+            logging.debug(f"Product ID '{numeric_id}' extracted from original URL is present in final URL")
+            return True
+    
+    # Fallback: if product_id parameter provided and extraction failed, check if it's in final URL
+    if product_id:
+        if product_id in final_url:
+            logging.debug(f"Product ID '{product_id}' from parameter is present in final URL")
+            return True
+    
+    # If we can't find the product ID in the final URL, it's not preserved
+    logging.debug(f"Product ID from original URL not found in final URL")
+    return False
+
+
+def get_bunnycdn_public_url(storage_path: str) -> str:
+    """
+    Construct public URL for BunnyCDN storage object using Pull Zone hostname.
+    
+    Args:
+        storage_path: Path to the object in storage (e.g., "scraped_product_images/client/article/image.jpg")
+        
+    Returns:
+        Public URL to access the stored object on BunnyCDN via Pull Zone
+    """
+    # Use Pull Zone hostname for public access (CDN URL)
+    # Default to scraper.b-cdn.net, but can be overridden via environment variable
+    pull_zone_url = os.getenv("BUNNYCDN_PULL_ZONE_URL", "https://scraper.b-cdn.net")
     # Ensure storage_path doesn't have leading slash
     storage_path = storage_path.lstrip('/')
-    return f"{base_url}/{storage_path}"
+    return f"{pull_zone_url}/{storage_path}"
 
 
 def get_supabase_public_url(storage_path: str, supabase_url: str = None) -> str:
@@ -80,7 +128,7 @@ def get_supabase_public_url(storage_path: str, supabase_url: str = None) -> str:
     DEPRECATED: Use get_bunnycdn_public_url instead.
     
     Args:
-        storage_path: Path to the object in storage (e.g., "scraped_product_images/client/article/references/image.jpg")
+        storage_path: Path to the object in storage (e.g., "scraped_product_images/client/article/image.jpg")
                      Note: This should NOT include the bucket name, just the path within the bucket
         supabase_url: Supabase project URL (defaults to SUPABASE_URL env var)
         
@@ -100,6 +148,13 @@ def get_supabase_public_url(storage_path: str, supabase_url: str = None) -> str:
 
 # --- Database Interaction with Supabase ---
 
+def get_assets_table_name() -> str:
+    """
+    Get the assets table name from environment variable, default to 'assets'.
+    Allows temporary override for testing (e.g., 'onboarding_assets').
+    """
+    return os.getenv("SUPABASE_TABLE_NAME", "assets")
+
 def fetch_new_uploads(client_name: str, supabase: Client) -> List[Dict[str, Any]]:
     """
     Fetches all rows for a given client from the assets table
@@ -107,8 +162,9 @@ def fetch_new_uploads(client_name: str, supabase: Client) -> List[Dict[str, Any]
     """
     logging.info(f"Fetching unscraped products for client: {client_name}")
     try:
+        table_name = get_assets_table_name()
         response = (
-            supabase.table("assets")
+            supabase.table(table_name)
             .select("article_id, product_link, product_name, client, is_scraped, preview_image") # Include preview_image for image-based classification
             .eq("client", client_name)
             .eq("is_scraped", False)
@@ -186,7 +242,6 @@ async def update_single_item(
     
     logging.info(f"Updating database for SKU: {sku}")
     logging.info(f"Result status: {result.status}, saved_count: {result.saved_count}")
-    logging.info(f"kept_links: {result.kept_links}")
     
     # Use the likely_null value passed from the caller (which includes redirect detection)
     # Don't recalculate here, as redirect detection happens in process_batch
@@ -300,8 +355,9 @@ async def update_single_item(
         logging.info(f"Update payload: category={category}, subcategory={subcategory}, tags keys={list(tags_data.keys())}")
     
     try:
+        table_name = get_assets_table_name()
         (
-            supabase.table("assets")
+            supabase.table(table_name)
             .update(base_update)
             .eq("article_id", sku)
             .execute()
@@ -322,8 +378,9 @@ async def update_single_item(
                 fallback_update["reference"] = result.kept_links
             fallback_update["tags"] = tags_data
             
+            table_name = get_assets_table_name()
             (
-                supabase.table("assets")
+                supabase.table(table_name)
                 .update(fallback_update)
                 .eq("article_id", sku)
                 .execute()
@@ -364,8 +421,10 @@ async def upload_images_to_bunnycdn_ftp(
     ftp_username = os.getenv("BUNNYCDN_FTP_USERNAME")
     ftp_password = os.getenv("BUNNYCDN_FTP_PASSWORD")
     
+    # If BunnyCDN credentials are not set, return empty list (will fall back to Supabase)
     if not ftp_username or not ftp_password:
-        raise ValueError("BUNNYCDN_FTP_USERNAME and BUNNYCDN_FTP_PASSWORD must be set in environment variables")
+        logging.info("BunnyCDN credentials not set - will fall back to Supabase Storage")
+        return []
     
     logging.info(f"Starting FTP upload of {len(image_urls)} images to BunnyCDN for client: {client_name}, article: {article_id}")
     
@@ -399,7 +458,7 @@ async def upload_images_to_bunnycdn_ftp(
                         sanitized_client = sanitize_for_storage_path(client_name)
                         sanitized_article_id = sanitize_for_storage_path(article_id)
                         # Create storage path
-                        storage_path = f"scraped_product_images/{sanitized_client}/{sanitized_article_id}/references/{filename}"
+                        storage_path = f"scraped_product_images/{sanitized_client}/{sanitized_article_id}/{filename}"
                         
                         downloaded_images.append({
                             'filename': filename,
@@ -462,6 +521,15 @@ def _upload_to_bunnycdn_ftp_sync(
         ftp.login(ftp_username, ftp_password)
         logging.info("✓ Connected to BunnyCDN FTP")
         
+        # Capture the starting directory (where FTP login puts us)
+        try:
+            starting_directory = ftp.pwd()
+            logging.debug(f"Starting FTP directory: {starting_directory}")
+        except Exception:
+            # If pwd() fails, assume we're at root or can't determine
+            starting_directory = None
+            logging.debug("Could not determine starting FTP directory, will navigate from current location")
+        
         # Upload each image
         for img_info in downloaded_images:
             filename = img_info['filename']
@@ -469,31 +537,38 @@ def _upload_to_bunnycdn_ftp_sync(
             storage_path = img_info['storage_path']
             
             try:
+                # Reset to starting directory before processing each file
+                # This ensures we always navigate from the same base path
+                if starting_directory:
+                    try:
+                        ftp.cwd(starting_directory)
+                    except Exception as reset_error:
+                        logging.warning(f"Could not reset to starting directory {starting_directory}: {reset_error}")
+                        # Continue anyway - might still work from current location
+                
                 # Create directory structure if needed
                 path_parts = storage_path.split('/')
-                directory_parts = path_parts[:-1]  # All parts except filename
+                directory_parts = [p for p in path_parts[:-1] if p]  # All parts except filename, skip empty
                 
-                # Navigate/create directory structure
-                ftp.cwd('/')  # Start from root
+                # Navigate/create directory structure from starting directory
                 for part in directory_parts:
-                    if part:  # Skip empty parts
+                    try:
+                        # Try to change to directory
+                        ftp.cwd(part)
+                    except Exception:
+                        # Directory doesn't exist, create it
                         try:
-                            # Try to change to directory
+                            ftp.mkd(part)
                             ftp.cwd(part)
-                        except Exception:
-                            # Directory doesn't exist, create it
+                            logging.debug(f"Created directory: {part}")
+                        except Exception as mkd_error:
+                            # Directory might have been created by another process
+                            # Try to change to it again
                             try:
-                                ftp.mkd(part)
                                 ftp.cwd(part)
-                                logging.debug(f"Created directory: {part}")
-                            except Exception as mkd_error:
-                                # Directory might have been created by another process
-                                # Try to change to it again
-                                try:
-                                    ftp.cwd(part)
-                                except Exception:
-                                    logging.warning(f"Could not create/access directory {part}: {mkd_error}")
-                                    raise
+                            except Exception:
+                                logging.warning(f"Could not create/access directory {part}: {mkd_error}")
+                                raise
                 
                 # Upload file data
                 image_file = BytesIO(image_data)
@@ -531,14 +606,135 @@ async def upload_images_to_storage_direct(
     client_name: str, 
     article_id: str, 
     supabase: Client = None
+) -> Tuple[List[str], str]:
+    """
+    Upload images directly from URLs to storage.
+    Tries BunnyCDN FTP first, falls back to Supabase Storage if BunnyCDN credentials not set.
+    Returns tuple of (list of public URLs, storage_type) where storage_type is 'bunnycdn' or 'supabase'.
+    """
+    # Try BunnyCDN FTP first
+    bunnycdn_urls = await upload_images_to_bunnycdn_ftp(image_urls, client_name, article_id)
+    
+    # If BunnyCDN returned URLs, use those
+    if bunnycdn_urls:
+        return bunnycdn_urls, 'bunnycdn'
+    
+    # Fall back to Supabase Storage if BunnyCDN not configured
+    if not supabase:
+        logging.warning("Supabase client not provided, cannot upload to Supabase Storage")
+        return [], 'none'
+    
+    logging.info(f"Falling back to Supabase Storage for {len(image_urls)} images")
+    supabase_urls = await upload_images_to_supabase_storage(image_urls, client_name, article_id, supabase)
+    return supabase_urls, 'supabase'
+
+
+async def upload_images_to_supabase_storage(
+    image_urls: List[str], 
+    client_name: str, 
+    article_id: str, 
+    supabase: Client
 ) -> List[str]:
     """
-    Upload images directly from URLs to BunnyCDN via FTP.
-    DEPRECATED: Supabase Storage upload replaced with BunnyCDN FTP.
+    Upload images directly from URLs to Supabase Storage.
     Returns list of public URLs for uploaded images.
     """
-    # Use BunnyCDN FTP instead of Supabase Storage
-    return await upload_images_to_bunnycdn_ftp(image_urls, client_name, article_id)
+    uploaded_urls = []
+    
+    if not image_urls:
+        logging.warning("No image URLs provided for upload")
+        return uploaded_urls
+    
+    logging.info(f"Starting Supabase Storage upload of {len(image_urls)} images for client: {client_name}, article: {article_id}")
+    
+    for i, image_url in enumerate(image_urls, 1):
+        try:
+            # Detect file extension and content type from URL
+            file_extension = os.path.splitext(urlparse(image_url).path)[1].lower()
+            if not file_extension:
+                file_extension = '.jpg'  # Default fallback
+            
+            # Map extensions to content types
+            content_type_map = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg', 
+                '.png': 'image/png',
+                '.gif': 'image/gif',
+                '.webp': 'image/webp',
+                '.bmp': 'image/bmp',
+                '.tiff': 'image/tiff',
+                '.svg': 'image/svg+xml'
+            }
+            content_type = content_type_map.get(file_extension, 'image/jpeg')
+            
+            # Create storage path
+            filename = f"image_{i}{file_extension}"
+            sanitized_client = sanitize_for_storage_path(client_name)
+            sanitized_article_id = sanitize_for_storage_path(article_id)
+            storage_path = f"scraped_product_images/{sanitized_client}/{sanitized_article_id}/{filename}".strip('/')
+            
+            logging.info(f"Downloading and uploading {filename} from: {image_url}")
+            
+            # Download image data directly from URL
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=30) as response:
+                    if response.status == 200:
+                        image_data = await response.read()
+                        
+                        if not image_data:
+                            logging.error(f"Downloaded image data is empty: {image_url}")
+                            continue
+                        
+                        # Validate image data before upload
+                        if len(image_data) < 100:
+                            logging.warning(f"Image data too small ({len(image_data)} bytes) for {image_url}, skipping")
+                            continue
+                        
+                        # Upload directly to Supabase Storage
+                        try:
+                            upload_response = supabase.storage.from_("assets").upload(
+                                path=storage_path,
+                                file=image_data,
+                                file_options={"content-type": content_type, "upsert": "true"}
+                            )
+                            
+                            if upload_response:
+                                public_url = get_supabase_public_url(storage_path)
+                                uploaded_urls.append(public_url)
+                                logging.info(f"✓ Uploaded {filename} to Supabase Storage: {public_url}")
+                            else:
+                                logging.warning(f"✗ Failed to upload {filename} - no response from Supabase")
+                                
+                        except Exception as upload_error:
+                            if "409" in str(upload_error) or "Duplicate" in str(upload_error):
+                                # File exists, try to update it instead
+                                logging.info(f"File {filename} already exists, updating instead...")
+                                try:
+                                    update_response = supabase.storage.from_("assets").update(
+                                        path=storage_path,
+                                        file=image_data,
+                                        file_options={"content-type": content_type}
+                                    )
+                                    if update_response:
+                                        public_url = get_supabase_public_url(storage_path)
+                                        uploaded_urls.append(public_url)
+                                        logging.info(f"✓ Updated {filename} in Supabase Storage: {public_url}")
+                                    else:
+                                        logging.warning(f"✗ Failed to update {filename} - no response from Supabase")
+                                except Exception as update_error:
+                                    logging.error(f"Failed to update existing file {filename}: {update_error}")
+                            else:
+                                logging.error(f"Upload error for {filename}: {upload_error}")
+                    else:
+                        logging.warning(f"Failed to download image from {image_url}: HTTP {response.status}")
+                        
+        except Exception as e:
+            logging.error(f"Error processing {image_url}: {e}")
+            import traceback
+            logging.error(f"Full traceback: {traceback.format_exc()}")
+    
+    logging.info(f"Supabase Storage upload complete. {len(uploaded_urls)}/{len(image_urls)} images uploaded successfully")
+    return uploaded_urls
 
 
 # --- End Database Interaction ---
@@ -600,6 +796,143 @@ def get_domain_expected_category(domain: str) -> Optional[str]:
             return expected_category
     
     return None
+
+
+async def validate_individual_images(
+    image_urls: List[str],
+    category: str,
+    subcategory: Optional[str],
+    product_name: Optional[str],
+    api_key: str
+) -> List[int]:
+    """
+    Validate each image individually against category/subcategory using Gemini Vision API.
+    Returns list of indices for images that match the category/subcategory.
+    
+    Args:
+        image_urls: List of image URLs to validate
+        category: Product category (e.g., "Furniture", "Eyewear")
+        subcategory: Product subcategory (e.g., "Sofas", "Sunglasses") or None
+        product_name: Product name for context
+        api_key: Gemini API key
+        
+    Returns:
+        List of indices (0-based) for images that match the category/subcategory
+    """
+    if not image_urls or len(image_urls) == 0:
+        return []  # No images to validate
+    
+    if len(image_urls) == 1:
+        return [0]  # Single image - assume valid (less risk, and we need at least one)
+    
+    matching_indices = []
+    
+    try:
+        import google.generativeai as genai
+        from tag_generator import AITagGenerator
+        import io
+        from PIL import Image
+        
+        # Download images for validation
+        tag_generator = AITagGenerator(api_key=api_key)
+        images_for_validation = []  # List of (original_index, image) tuples
+        
+        for idx, img_url in enumerate(image_urls[:20]):  # Limit to 20 images for cost control
+            try:
+                image_data = await tag_generator.download_image_for_analysis(img_url)
+                if image_data:
+                    image = Image.open(io.BytesIO(image_data))
+                    images_for_validation.append((idx, image))  # Store original index
+            except Exception as e:
+                logging.warning(f"Failed to download image for validation {img_url}: {e}")
+                continue
+        
+        if len(images_for_validation) == 0:
+            logging.warning("No images could be downloaded for validation, keeping all images")
+            return list(range(len(image_urls)))  # Default to keeping all if we can't validate
+        
+        # Build validation prompt - focus on PRIMARY product, allow logos/text overlays
+        subcategory_text = f" (specifically {subcategory})" if subcategory else ""
+        product_context = f"\nPRODUCT NAME: {product_name}" if product_name else ""
+        
+        validation_prompt = f"""Analyze this product image and determine if the PRIMARY/MAIN product shown matches the expected category.
+
+EXPECTED PRODUCT TYPE: {category}{subcategory_text}{product_context}
+
+TASK:
+Check if the PRIMARY/MAIN product in this image is of type: {category}{subcategory_text}
+
+CRITERIA:
+- ✓ VALID: The PRIMARY product shown is {category}{subcategory_text}
+- ✓ VALID: Logo/text overlays are OK as long as the main product matches
+- ✓ VALID: Different angles/views of the same product type
+- ✗ INVALID: The PRIMARY product is NOT {category}{subcategory_text}
+- ✗ INVALID: Image shows navigation, headers, or page elements without a product
+- ✗ INVALID: Image shows a completely different product category
+
+Focus on the MAIN product in the image. Logos, watermarks, or text overlays in corners are acceptable as long as the primary product matches.
+
+Return ONLY valid JSON:
+{{
+  "matches_category": <true or false>,
+  "confidence": <float between 0.0 and 1.0>,
+  "reason": "<brief explanation>"
+}}
+
+IMPORTANT:
+- "matches_category": true if the PRIMARY product matches {category}{subcategory_text}
+- "confidence": How confident you are (0.0 = not confident, 1.0 = very confident)
+- Focus on the main product, not logos/text overlays"""
+        
+        # Initialize Gemini model
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        # Validate each image individually
+        for idx, image in images_for_validation:
+            try:
+                response = model.generate_content(
+                    [validation_prompt, image],
+                    generation_config={
+                        "temperature": 0.1,
+                        "response_mime_type": "application/json",
+                    }
+                )
+            except Exception:
+                # Fallback if response_mime_type not supported
+                response = model.generate_content(
+                    [validation_prompt, image],
+                    generation_config={
+                        "temperature": 0.1,
+                    }
+                )
+            
+            ai_response = response.text.strip()
+            # Remove markdown code blocks if present
+            if ai_response.startswith("```"):
+                lines = ai_response.split("\n")
+                ai_response = "\n".join(lines[1:-1]) if lines[-1].startswith("```") else "\n".join(lines[1:])
+            
+            result = json.loads(ai_response)
+            matches = result.get("matches_category", False)
+            confidence = float(result.get("confidence", 0.0))
+            reason = result.get("reason", "")
+            
+            if matches:
+                matching_indices.append(idx)
+                logging.debug(f"✓ Image {idx} matches {category}/{subcategory} (confidence: {confidence:.2f}) - {reason}")
+            else:
+                logging.info(f"✗ Image {idx} does not match {category}/{subcategory} (confidence: {confidence:.2f}) - {reason}")
+        
+        logging.info(f"Image validation: {len(matching_indices)}/{len(images_for_validation)} images match {category}/{subcategory}")
+        return matching_indices
+        
+    except Exception as e:
+        logging.error(f"Error validating individual images against category: {e}")
+        import traceback
+        logging.error(f"Validation error traceback: {traceback.format_exc()}")
+        # On error, default to keeping all images (don't block on validation failure)
+        return list(range(len(image_urls)))
 
 
 async def classify_from_preview_image(
@@ -858,8 +1191,9 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
                             "tags": None  # No tags for image-only classification
                         }
                         
+                        table_name = get_assets_table_name()
                         (
-                            supabase.table("assets")
+                            supabase.table(table_name)
                             .update(base_update)
                             .eq("article_id", sku)
                             .execute()
@@ -867,8 +1201,9 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
                         logging.info(f"✓ Classified from preview image: {category}/{subcategory} (confidence: {confidence:.2f})")
                     else:
                         # Mark as scraped and likely_null even if classification failed
+                        table_name = get_assets_table_name()
                         (
-                            supabase.table("assets")
+                            supabase.table(table_name)
                             .update({"is_scraped": True, "likely_null": True})
                             .eq("article_id", sku)
                             .execute()
@@ -880,8 +1215,9 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
                     logging.error(f"Error processing preview image for {name}: {e}")
                     # Mark as scraped and likely_null on error
                     try:
+                        table_name = get_assets_table_name()
                         (
-                            supabase.table("assets")
+                            supabase.table(table_name)
                             .update({"is_scraped": True, "likely_null": True})
                             .eq("article_id", sku)
                             .execute()
@@ -931,16 +1267,30 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
             likely_null = result.status in ['NOT_FOUND', 'FETCH_FAILED', 'INVALID_URL']
             
             # Check for redirects to different pages (path changed)
+            # Only flag as likely_null if the product ID is NOT preserved in the redirect
             if result.final_url:
                 from anchor_selector import urls_have_different_paths
                 if urls_have_different_paths(url, result.final_url):
-                    logging.warning(f"URL redirected to different page: {url} → {result.final_url}, flagging as likely_null")
-                    likely_null = True
+                    # Check if product ID is preserved in the redirect
+                    if sku:
+                        product_id_preserved = is_product_id_preserved_in_redirect(url, result.final_url, sku)
+                        logging.debug(f"Checking product ID preservation: sku='{sku}', original_url='{url}', final_url='{result.final_url}', preserved={product_id_preserved}")
+                        if product_id_preserved:
+                            logging.info(f"URL redirected but product ID preserved: {url} → {result.final_url}, allowing redirect")
+                            # Don't flag as likely_null - this is a valid redirect (e.g., short URL → full product page)
+                        else:
+                            logging.warning(f"URL redirected to different page (product ID '{sku}' not found in final URL): {url} → {result.final_url}, flagging as likely_null")
+                            likely_null = True
+                    else:
+                        logging.warning(f"URL redirected but no SKU available to check: {url} → {result.final_url}, flagging as likely_null")
+                        likely_null = True
             
             # Upload images directly to Supabase Storage from URLs
             # ONLY if likely_null is False (we have an active product page)
             storage_urls = []
+            storage_type = 'none'
             tag_result = None
+            original_image_urls = result.kept_links.copy() if result.kept_links else []  # Store original URLs for validation
             
             if likely_null:
                 logging.warning(f"Skipping image upload for {name or 'Unknown Product'} - page is likely_null (status: {result.status})")
@@ -948,12 +1298,13 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
                 # Clear kept_links to prevent any image processing
                 result.kept_links = []
             elif result.kept_links:
-                logging.info(f"Page is active (likely_null=False), uploading {len(result.kept_links)} images to BunnyCDN")
+                logging.info(f"Page is active (likely_null=False), uploading {len(result.kept_links)} images")
                 
-                storage_urls = await upload_images_to_bunnycdn_ftp(
+                storage_urls, storage_type = await upload_images_to_storage_direct(
                     result.kept_links, 
                     client_name, 
-                    sku or f'product_{i}'  # sku is the article_id
+                    sku or f'product_{i}',  # sku is the article_id
+                    supabase
                 )
                 
                 # Update result with storage URLs
@@ -1081,6 +1432,48 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
                 
                 if category:
                     logging.info(f"✓ Classified product: {category}/{subcategory} (confidence: {classification_confidence:.2f}, source: {classification_source})")
+                    
+                    # Validate images individually and filter to keep only matching images
+                    # Only validate if we have category, multiple original images, storage URLs were uploaded, and not already flagged as likely_null
+                    if original_image_urls and len(original_image_urls) > 1 and storage_urls and not likely_null:
+                        matching_indices = await validate_individual_images(
+                            image_urls=original_image_urls,  # Use original URLs for validation
+                            category=category,
+                            subcategory=subcategory,
+                            product_name=name,
+                            api_key=api_key
+                        )
+                        
+                        if len(matching_indices) == 0:
+                            # No images match - flag as likely_null
+                            logging.warning(f"No images match classified category {category}/{subcategory}. Clearing storage URLs to prevent incorrect image storage.")
+                            storage_urls = []  # Clear storage URLs (images already uploaded but won't be saved to DB)
+                            result.kept_links = []  # Clear kept_links
+                            likely_null = True  # Flag as problematic
+                        elif len(matching_indices) < len(original_image_urls):
+                            # Some images don't match - filter to keep only matching ones
+                            # Ensure indices are valid and within bounds
+                            valid_indices = [i for i in matching_indices if 0 <= i < len(original_image_urls) and i < len(storage_urls)]
+                            
+                            if len(valid_indices) == 0:
+                                # No valid matching indices - flag as likely_null
+                                logging.warning(f"No valid matching images after filtering. Clearing storage URLs.")
+                                storage_urls = []
+                                result.kept_links = []
+                                likely_null = True
+                            else:
+                                filtered_original_urls = [original_image_urls[i] for i in valid_indices]
+                                filtered_storage_urls = [storage_urls[i] for i in valid_indices]
+                                
+                                logging.info(f"Filtered images: {len(valid_indices)}/{len(original_image_urls)} match {category}/{subcategory}. Keeping {len(filtered_storage_urls)} matching images.")
+                                
+                                # Update with filtered lists
+                                original_image_urls = filtered_original_urls
+                                storage_urls = filtered_storage_urls
+                                result.kept_links = filtered_storage_urls
+                        else:
+                            # All images match - no filtering needed
+                            logging.info(f"All {len(matching_indices)} images match {category}/{subcategory}")
                 else:
                     logging.warning(f"✗ Could not classify product (text: {text_result.product_type if text_result else 'N/A'}, image: {image_category_tags})")
             # Note: If classification failed, category and subcategory will both be None
@@ -1093,7 +1486,8 @@ async def process_batch(rows: List[Dict[str, Any]], client_name: str, supabase: 
             if result.saved_count > 0:
                 logging.info(f"✓ Successfully extracted {result.saved_count} images for {name or 'Unknown Product'}")
                 if storage_urls:
-                    logging.info(f"✓ Uploaded {len(storage_urls)} images to BunnyCDN")
+                    storage_type_name = storage_type.capitalize() if storage_type != 'none' else 'Storage'
+                    logging.info(f"✓ Uploaded {len(storage_urls)} images to {storage_type_name}")
                 if tag_result and not tag_result.error_message:
                     logging.info(f"✓ Generated {len(tag_result.generated_tags)} AI tags")
             else:

@@ -5,7 +5,7 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from batch_processor import process_batch, fetch_new_uploads
+from batch_processor import process_batch, fetch_new_uploads, get_assets_table_name
 from tag_generator import AITagGenerator, TagResult
 import logging
 from typing import Set, List, Dict, Any
@@ -68,7 +68,8 @@ async def health_check():
     try:
         supabase = get_supabase_client()
         # Test database connection
-        supabase.table("assets").select("id").limit(1).execute()
+        table_name = get_assets_table_name()
+        supabase.table(table_name).select("id").limit(1).execute()
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
@@ -292,8 +293,9 @@ async def get_products_with_tags(client_name: str, limit: int = 50):
         supabase = get_supabase_client()
         
         # Query products with generated tags
+        table_name = get_assets_table_name()
         response = (
-            supabase.table("assets")
+            supabase.table(table_name)
             .select("article_id, product_name, product_link, tags, category_tags, style_tags, material_tags, color_tags, brand_tags, reference")
             .eq("client", client_name)
             .not_.is_("tags", "null")

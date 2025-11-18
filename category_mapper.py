@@ -11,7 +11,7 @@ from typing import Dict, Optional, Tuple, List
 CATEGORIES_WITH_SUBCATEGORIES: Dict[str, List[str]] = {
     "Eyewear": [
         "Sunglasses", "Goggles", "Reading Glasses", "Safety Glasses",
-        "Frame", "Lens", "Sports", "Ski/Snow"
+        "Frame", "Lens", "Sports"
     ],
     "Vehicles": [
         "Cars", "Motorcycles", "Buses/Vans", "Trucks", "Scooters",

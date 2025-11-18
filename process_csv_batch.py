@@ -25,7 +25,7 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-from batch_processor import process_batch, update_single_item
+from batch_processor import process_batch, update_single_item, get_assets_table_name
 from anchor_selector import learn_domain_selector, DownloadResult
 from tag_generator import AITagGenerator, TagResult
 from text_extractor import extract_all_text_data, TextExtractionResult
@@ -93,12 +93,13 @@ async def ensure_product_in_db(product: Dict[str, Any], client_name: str, supaba
         True if product exists or was inserted, False on error
     """
     try:
+        table_name = get_assets_table_name()
         # Check if product exists
-        response = supabase.table("assets").select("article_id").eq("article_id", product['sku']).execute()
+        response = supabase.table(table_name).select("article_id").eq("article_id", product['sku']).execute()
         
         if response.data:
             # Product exists, update new_upload flag
-            supabase.table("assets").update({
+            supabase.table(table_name).update({
                 "new_upload": True,
                 "product_link": product['product_url'],
                 "product_name": product.get('product_name'),
@@ -107,7 +108,7 @@ async def ensure_product_in_db(product: Dict[str, Any], client_name: str, supaba
             return True
         else:
             # Product doesn't exist, insert it
-            supabase.table("assets").insert({
+            supabase.table(table_name).insert({
                 "article_id": product['sku'],
                 "product_link": product['product_url'],
                 "product_name": product.get('product_name'),
@@ -120,7 +121,8 @@ async def ensure_product_in_db(product: Dict[str, Any], client_name: str, supaba
         if "duplicate" in str(e).lower() or "unique" in str(e).lower():
             # Product exists, just update
             try:
-                supabase.table("assets").update({
+                table_name = get_assets_table_name()
+                supabase.table(table_name).update({
                     "new_upload": True,
                     "product_link": product['product_url'],
                     "product_name": product.get('product_name'),
